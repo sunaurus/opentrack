@@ -25,9 +25,13 @@ using origin = vr::ETrackingUniverseOrigin;
 struct settings : opts
 {
     value<QVariant> device_serial;
+    value<QVariantList> calibration_matrix;
+    value<bool> calibration_enabled;
     settings() :
         opts("valve-steamvr"),
-        device_serial(b, "serial", QVariant(QVariant::String))
+        device_serial(b, "serial", QVariant(QVariant::String)),
+        calibration_matrix(b, "calibration-matrix", QVariantList()),
+        calibration_enabled(b, "calibration-enabled", false)
     {}
 };
 
@@ -69,8 +73,23 @@ class steamvr : public QObject, public ITracker
 
     static void matrix_to_euler(double& yaw, double& pitch, double& roll, const vr::HmdMatrix34_t& result);
 
+    struct mat34
+    {
+        double m[3][4] {};
+    };
+
+    static mat34 identity_matrix();
+    static mat34 from_vr_matrix(const vr::HmdMatrix34_t& mat);
+    static vr::HmdMatrix34_t to_vr_matrix(const mat34& mat);
+    static mat34 invert_rigid(const mat34& mat);
+    static mat34 multiply(const mat34& a, const mat34& b);
+    static QVariantList to_variant_list(const mat34& mat);
+    static bool from_variant_list(const QVariantList& list, mat34& out);
+
     settings s;
     unsigned device_index{UINT_MAX};
+    mat34 calibration_inv{ identity_matrix() };
+    bool calibration_ready{false};
 
 public:
     steamvr();
@@ -90,9 +109,14 @@ private:
     Ui::dialog ui;
     settings s;
 
+    void update_calibration_label();
+    void run_calibration_wizard();
+
 private slots:
     void doOK();
     void doCancel();
+    void doRunCalibration();
+    void doClearCalibration();
 };
 
 class steamvr_metadata : public Metadata

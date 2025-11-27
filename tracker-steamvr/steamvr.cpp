@@ -225,6 +225,13 @@ module_status steamvr::start_tracker(QFrame*)
             if (auto* c = vr::VRCompositor(); c != nullptr)
             {
                 c->SetTrackingSpace(origin::TrackingUniverseSeated);
+                calibration_ready = false;
+                steamvr::mat34 m;
+                if (s.calibration_enabled() && from_variant_list(s.calibration_matrix(), m))
+                {
+                    calibration_inv = m;
+                    calibration_ready = true;
+                }
                 return status_ok();
             }
             else
@@ -244,13 +251,21 @@ void steamvr::data(double* data)
         {
             constexpr int c = 10;
 
-            const auto& result = pose.mDeviceToAbsoluteTracking;
+            const auto& result_raw = pose.mDeviceToAbsoluteTracking;
+            vr::HmdMatrix34_t corrected = result_raw;
 
-            data[TX] = (double)(-result.m[0][3] * c);
-            data[TY] = (double)(result.m[1][3] * c);
-            data[TZ] = (double)(result.m[2][3] * c);
+            if (calibration_ready)
+            {
+                mat34 raw = from_vr_matrix(result_raw);
+                mat34 corrected_mat = multiply(calibration_inv, raw);
+                corrected = to_vr_matrix(corrected_mat);
+            }
 
-            matrix_to_euler(data[Yaw], data[Pitch], data[Roll], result);
+            data[TX] = (double)(-corrected.m[0][3] * c);
+            data[TY] = (double)(corrected.m[1][3] * c);
+            data[TZ] = (double)(corrected.m[2][3] * c);
+
+            matrix_to_euler(data[Yaw], data[Pitch], data[Roll], corrected);
 
             constexpr double r2d = 180 / M_PI;
             data[Yaw] *= r2d; data[Pitch] *= r2d; data[Roll] *= r2d;
@@ -297,12 +312,99 @@ void steamvr::matrix_to_euler(double& yaw, double& pitch, double& roll, const vr
     roll = std::asin(d(result.m[1][0]));
 }
 
+auto steamvr::identity_matrix() -> mat34
+{
+    mat34 out;
+    out.m[0][0] = out.m[1][1] = out.m[2][2] = 1.0;
+    return out;
+}
+
+auto steamvr::from_vr_matrix(const vr::HmdMatrix34_t& mat) -> mat34
+{
+    mat34 out;
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 4; c++)
+            out.m[r][c] = mat.m[r][c];
+    return out;
+}
+
+auto steamvr::to_vr_matrix(const mat34& mat) -> vr::HmdMatrix34_t
+{
+    vr::HmdMatrix34_t out{};
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 4; c++)
+            out.m[r][c] = float(mat.m[r][c]);
+    return out;
+}
+
+auto steamvr::invert_rigid(const mat34& mat) -> mat34
+{
+    mat34 out = identity_matrix();
+    // rotation transpose
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+            out.m[r][c] = mat.m[c][r];
+
+    // translation = -R^T * t
+    for (int r = 0; r < 3; r++)
+    {
+        double t = 0;
+        for (int c = 0; c < 3; c++)
+            t -= out.m[r][c] * mat.m[c][3];
+        out.m[r][3] = t;
+    }
+    return out;
+}
+
+auto steamvr::multiply(const mat34& a, const mat34& b) -> mat34
+{
+    mat34 out{};
+    for (int r = 0; r < 3; r++)
+    {
+        for (int c = 0; c < 3; c++)
+        {
+            double v = 0;
+            for (int k = 0; k < 3; k++)
+                v += a.m[r][k] * b.m[k][c];
+            out.m[r][c] = v;
+        }
+
+        double t = 0;
+        for (int k = 0; k < 3; k++)
+            t += a.m[r][k] * b.m[k][3];
+        out.m[r][3] = t + a.m[r][3];
+    }
+    return out;
+}
+
+auto steamvr::to_variant_list(const mat34& mat) -> QVariantList
+{
+    QVariantList list;
+    list.reserve(12);
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 4; c++)
+            list << mat.m[r][c];
+    return list;
+}
+
+bool steamvr::from_variant_list(const QVariantList& list, mat34& out)
+{
+    if (list.size() != 12)
+        return false;
+
+    for (int i = 0; i < 12; i++)
+        out.m[i / 4][i % 4] = list[i].toDouble();
+    return true;
+}
+
 steamvr_dialog::steamvr_dialog()
 {
     ui.setupUi(this);
 
     connect(ui.buttonBox, SIGNAL(accepted()), this, SLOT(doOK()));
     connect(ui.buttonBox, SIGNAL(rejected()), this, SLOT(doCancel()));
+    connect(ui.runCalibration, &QPushButton::clicked, this, &steamvr_dialog::doRunCalibration);
+    connect(ui.clearCalibration, &QPushButton::clicked, this, &steamvr_dialog::doClearCalibration);
 
     ui.device->clear();
     ui.device->addItem("First available", QVariant(QVariant::String));
@@ -317,6 +419,8 @@ steamvr_dialog::steamvr_dialog()
     }
 
     tie_setting(s.device_serial, ui.device);
+
+    update_calibration_label();
 }
 
 void steamvr_dialog::doOK()
@@ -328,6 +432,69 @@ void steamvr_dialog::doOK()
 void steamvr_dialog::doCancel()
 {
     close();
+}
+
+void steamvr_dialog::update_calibration_label()
+{
+    if (s.calibration_enabled())
+        ui.calibrationStatus->setText(tr("Saved"));
+    else
+        ui.calibrationStatus->setText(tr("No calibration"));
+}
+
+void steamvr_dialog::doRunCalibration()
+{
+    run_calibration_wizard();
+}
+
+void steamvr_dialog::run_calibration_wizard()
+{
+    const QString serial = ui.device->currentData().toString();
+    device_list d;
+    unsigned idx = UINT_MAX;
+
+    for (const device_spec& spec : d.devices())
+    {
+        if (serial.isEmpty() || serial == spec.to_string())
+        {
+            idx = spec.k;
+            break;
+        }
+    }
+
+    if (idx == UINT_MAX)
+    {
+        QMessageBox::warning(this, tr("Calibration"), tr("No device selected for calibration."));
+        return;
+    }
+
+    QMessageBox::information(this, tr("Calibration"),
+                             tr("Sit upright, look forward, and keep still while calibration samples the tracker pose."));
+
+    auto [ok, pose] = device_list::get_pose(idx);
+    if (!ok)
+    {
+        QMessageBox::warning(this, tr("Calibration"), tr("Unable to read pose from the selected device."));
+        return;
+    }
+
+    mat34 raw = from_vr_matrix(pose.mDeviceToAbsoluteTracking);
+    mat34 inv = invert_rigid(raw);
+
+    s.calibration_matrix = steamvr::to_variant_list(inv);
+    s.calibration_enabled = true;
+    s.b->save();
+
+    update_calibration_label();
+    QMessageBox::information(this, tr("Calibration"), tr("Calibration saved. It will be applied when tracking starts."));
+}
+
+void steamvr_dialog::doClearCalibration()
+{
+    s.calibration_enabled = false;
+    s.calibration_matrix = QVariantList();
+    s.b->save();
+    update_calibration_label();
 }
 
 
